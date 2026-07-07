@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -111,6 +112,7 @@ class ConfluenceExporter:
         self.session.auth = (email.strip(), api_token.strip())
         self.session.headers["Accept"] = "application/json"
         self._img_cache = {}
+        self._att_links = {}
         self.page_ids = set()
 
     # ---------- REST fetching ----------
@@ -209,6 +211,37 @@ class ConfluenceExporter:
             return f"#p{pid}"
         return self._abs_url(href)
 
+    def _attachment_link(self, page_id, filename):
+        """Resolve an attachment filename to its REST downloadLink.
+
+        Confluence Cloud returns 401 for API-token auth on the raw
+        /wiki/download/attachments/... URLs that export_view embeds, but the
+        /rest/api/content/.../attachment/.../download link from the v2
+        attachments API serves the binary fine.
+        """
+        if page_id not in self._att_links:
+            links = {}
+            try:
+                url = f"{self.base}/wiki/api/v2/pages/{page_id}/attachments"
+                params = {"limit": 250}
+                while True:
+                    data = self._get(url, params=params).json()
+                    for att in data.get("results", []):
+                        if att.get("downloadLink"):
+                            links[att.get("title") or ""] = att["downloadLink"]
+                    nxt = (data.get("_links") or {}).get("next")
+                    if not nxt:
+                        break
+                    url = self.base + nxt
+                    params = None
+            except Exception as e:
+                self.log(f"    attachment list failed for page {page_id}: {e}")
+            self._att_links[page_id] = links
+        dl = self._att_links[page_id].get(filename)
+        if not dl:
+            return None
+        return dl if dl.startswith("/wiki") else "/wiki" + dl
+
     def _fetch_image(self, url):
         url = html_mod.unescape(url)
         if url.startswith("data:"):
@@ -216,19 +249,30 @@ class ConfluenceExporter:
         full = self._abs_url(url)
         if full in self._img_cache:
             return self._img_cache[full]
+        # attachment/thumbnail URLs must go through the REST download link
+        m = re.search(r"/wiki/download/(?:attachments|thumbnails)/(\d+)/([^?#]+)", full)
+        if m and full.startswith(self.base):
+            dl = self._attachment_link(m.group(1), urllib.parse.unquote(m.group(2)))
+            if dl:
+                fetch_url = self.base + dl
+            else:
+                fetch_url = full
+        else:
+            fetch_url = full
         try:
             # only send our basic-auth credentials to the Confluence site itself
-            if full.startswith(self.base):
-                r = self.session.get(full, timeout=60)
+            if fetch_url.startswith(self.base):
+                r = self.session.get(fetch_url, timeout=60)
             else:
-                r = requests.get(full, timeout=60)
+                r = requests.get(fetch_url, timeout=60)
             r.raise_for_status()
             ctype = r.headers.get("Content-Type", "").split(";")[0].strip()
             if not ctype or "html" in ctype:
                 ctype = mimetypes.guess_type(full.split("?")[0])[0] or "image/png"
             data_uri = f"data:{ctype};base64,{base64.b64encode(r.content).decode()}"
         except Exception as e:
-            self.log(f"    image failed ({e.__class__.__name__}): {full[:100]}")
+            status = getattr(getattr(e, "response", None), "status_code", "")
+            self.log(f"    image failed ({e.__class__.__name__} {status}): {full[:100]}")
             data_uri = full  # leave the original URL in place
         self._img_cache[full] = data_uri
         return data_uri
@@ -383,7 +427,7 @@ class ConfluenceExporter:
         html_path = self.output_dir / f"{safe_title}_v{safe_ver}.html"
 
         html_path.write_text(doc, encoding="utf-8")
-        self.log("Rendering PDF with headless Edge ...")
+        self.log("Rendering PDF with headless Chromium ...")
         self.html_to_pdf(html_path, pdf_path)
         if not self.keep_html:
             html_path.unlink(missing_ok=True)

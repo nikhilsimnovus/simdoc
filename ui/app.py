@@ -29,7 +29,7 @@ from flask import (Flask, Response, abort, jsonify, render_template_string,
 # SimDoc UI version. Bump on every push to the simdoc repo so users can
 # confirm the Update button actually applied — the new number shows up in
 # the topbar after the page reloads.
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 UI_DIR = Path(__file__).resolve().parent
 # exporter.py lives next to app.py when installed (/opt/simdoc), one level
